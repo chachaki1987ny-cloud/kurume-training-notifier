@@ -5,6 +5,9 @@
  * 2027年2月20日・21日の久留米開催が掲載された場合に
  * LINEグループへ一度だけ通知します。
  *
+ * また、公式ページを正常に監視できなくなった場合には、
+ * 監視システムの異常としてLINE通知します。
+ *
  * LINE_GROUP_ID と LINE_CHANNEL_ACCESS_TOKEN は
  * Script Properties で管理します。
  */
@@ -20,17 +23,33 @@ function checkKuruScheduleChange() {
   const properties =
     PropertiesService.getScriptProperties();
 
-  // 公式サイトを取得
-  const response = UrlFetchApp.fetch(url, {
-    muteHttpExceptions: true
-  });
+  let response;
+
+  // -----------------------------
+  // 1. 公式サイトへアクセス
+  // -----------------------------
+  try {
+    response = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true
+    });
+  } catch (error) {
+    handleMonitoringError(
+      '公式サイトへのアクセスに失敗しました。',
+      properties,
+      url
+    );
+    return;
+  }
 
   const status = response.getResponseCode();
 
-  // サイト取得に失敗した場合は終了
+  // HTTP 200以外
   if (status !== 200) {
-    console.log(
-      'サイト取得失敗: HTTP ' + status
+    handleMonitoringError(
+      '公式サイトを正常に取得できませんでした。\n' +
+      'HTTPステータス: ' + status,
+      properties,
+      url
     );
     return;
   }
@@ -38,12 +57,47 @@ function checkKuruScheduleChange() {
   const html =
     response.getContentText('UTF-8');
 
-  // HTMLを表の行 <tr> ごとに分割
+  // -----------------------------
+  // 2. 日程表の構造を確認
+  // -----------------------------
   const rows =
     html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
 
-  // 「久留米」＋「2月20日または2月21日」
-  // が含まれる行を探す
+  const hasScheduleStructure =
+    rows.length >= 5 &&
+    html.includes('開催日') &&
+    html.includes('開催地') &&
+    html.includes('会場');
+
+  if (!hasScheduleStructure) {
+    handleMonitoringError(
+      '公式ページは取得できましたが、' +
+      '日程表を正常に読み取れませんでした。\n' +
+      'サイト構造が変更された可能性があります。',
+      properties,
+      url
+    );
+    return;
+  }
+
+  // ここまで正常なら、過去の異常状態を解除
+  if (
+    properties.getProperty(
+      'KURUME_MONITOR_ERROR'
+    ) === 'true'
+  ) {
+    properties.deleteProperty(
+      'KURUME_MONITOR_ERROR'
+    );
+
+    console.log(
+      '監視状態が正常に戻りました。'
+    );
+  }
+
+  // -----------------------------
+  // 3. 対象の久留米開催を検索
+  // -----------------------------
   const targetRows = rows.filter(function(row) {
 
     const text = row
@@ -73,6 +127,10 @@ function checkKuruScheduleChange() {
     targetRows.length > 0;
 
   console.log(
+    '日程表の行数: ' + rows.length
+  );
+
+  console.log(
     '対象の久留米開催情報: ' + found
   );
 
@@ -80,7 +138,7 @@ function checkKuruScheduleChange() {
     '該当行数: ' + targetRows.length
   );
 
-  // まだ公式ページに掲載されていない
+  // まだ掲載されていない
   if (!found) {
     console.log(
       '2027年2月20日・21日の久留米開催は、' +
@@ -89,7 +147,9 @@ function checkKuruScheduleChange() {
     return;
   }
 
-  // すでに通知済みか確認
+  // -----------------------------
+  // 4. 通知済みか確認
+  // -----------------------------
   const notified =
     properties.getProperty(
       'KURUME_2027_0220_NOTIFIED'
@@ -102,7 +162,9 @@ function checkKuruScheduleChange() {
     return;
   }
 
-  // 初めて対象情報を確認した場合のみLINE通知
+  // -----------------------------
+  // 5. 対象情報をLINE通知
+  // -----------------------------
   const sent = sendLineMessage(
     '【久留米告示研修 掲載確認】\n\n' +
     '2027年2月20日・21日の久留米開催が、' +
@@ -112,9 +174,8 @@ function checkKuruScheduleChange() {
     url
   );
 
-  // LINE送信成功時のみ通知済みとして保存
+  // 成功時のみ通知済みとして保存
   if (sent) {
-
     properties.setProperty(
       'KURUME_2027_0220_NOTIFIED',
       'true'
@@ -124,13 +185,62 @@ function checkKuruScheduleChange() {
       'LINE通知に成功しました。' +
       '通知済みとして保存しました。'
     );
-
   } else {
-
-    // 失敗時は保存せず、次回の定期実行で再試行
     console.log(
       'LINE通知に失敗しました。' +
-      '通知済みにはしていません。' +
+      '次回の定期実行で再試行します。'
+    );
+  }
+}
+
+
+/**
+ * 監視異常を処理する
+ */
+function handleMonitoringError(
+  errorMessage,
+  properties,
+  url
+) {
+
+  console.log(
+    '監視異常: ' + errorMessage
+  );
+
+  const alreadyNotified =
+    properties.getProperty(
+      'KURUME_MONITOR_ERROR'
+    );
+
+  // 同じ異常状態については繰り返し通知しない
+  if (alreadyNotified === 'true') {
+    console.log(
+      '監視異常はすでに通知済みです。'
+    );
+    return;
+  }
+
+  const sent = sendLineMessage(
+    '【告示研修 監視システム異常】\n\n' +
+    errorMessage + '\n\n' +
+    'サイト構造変更または一時的な障害の可能性があります。\n' +
+    '念のため公式サイトを手動で確認してください。\n\n' +
+    url
+  );
+
+  // LINE通知成功時だけ異常通知済みにする
+  if (sent) {
+    properties.setProperty(
+      'KURUME_MONITOR_ERROR',
+      'true'
+    );
+
+    console.log(
+      '監視異常をLINE通知しました。'
+    );
+  } else {
+    console.log(
+      '異常通知のLINE送信に失敗しました。' +
       '次回再試行します。'
     );
   }
@@ -155,7 +265,6 @@ function sendLineMessage(message) {
       'LINE_CHANNEL_ACCESS_TOKEN'
     );
 
-  // LINE設定が不足している場合は送信しない
   if (!groupId || !accessToken) {
     console.log(
       'LINEの認証情報が設定されていません。'
@@ -193,6 +302,5 @@ function sendLineMessage(message) {
     'LINE送信HTTP: ' + status
   );
 
-  // HTTP 200番台なら送信成功
   return status >= 200 && status < 300;
 }
